@@ -16,6 +16,7 @@ import urllib.request
 from copy import deepcopy
 
 import utils
+import yaml
 from crawl import naming_task
 from logger import logger
 from origin import Origin
@@ -68,14 +69,14 @@ def extract_one(url: str) -> list[str]:
 
     headers = {"User-Agent": "Clash.Meta; Mihomo"}
     subscriptions, content = [], ""
-    count, retry = 0, 3
+    count, retry = 0, 2
 
     while not content and count < retry:
         count += 1
 
         try:
             request = urllib.request.Request(url=url, headers=headers, method="GET")
-            response = urllib.request.urlopen(request, timeout=15, context=utils.CTX)
+            response = urllib.request.urlopen(request, timeout=10, context=utils.CTX)
 
             if re.search(regex, response.geturl(), flags=re.I):
                 subscriptions.append(response.geturl())
@@ -96,10 +97,42 @@ def extract_one(url: str) -> list[str]:
         if groups:
             subscriptions.extend(list(set([utils.url_complete(x) for x in groups if x])))
 
+        # extract from proxy-providers
+        providers, key = None, "proxy-providers"
+        try:
+            providers = yaml.load(content, Loader=yaml.SafeLoader).get(key, [])
+        except yaml.constructor.ConstructorError:
+            yaml.add_multi_constructor("str", lambda loader, suffix, node: str(node.value), Loader=yaml.SafeLoader)
+            providers = yaml.load(content, Loader=yaml.FullLoader).get(key, [])
+        except Exception as e:
+            pass
+
+        if providers and isinstance(providers, dict):
+            for _, v in providers.items():
+                if not v or not isinstance(v, dict) or v.get("type", "") != "http":
+                    continue
+
+                link = utils.trim(v.get("url", ""))
+                if link and (link.startswith("https://") or link.startswith("http://")):
+                    subscriptions.append(link)
+
     return subscriptions
 
 
 def recall(params: dict) -> list:
+    def inwrap(sub: str, nocache: bool = True, pardon: bool = False) -> dict:
+        config = deepcopy(params.get("config", {}))
+        config["sub"] = sub
+        config["saved"] = False
+        config["checked"] = False
+        config["nocache"] = nocache
+        config["pardon"] = pardon
+        config["name"] = naming_task(link)
+        config["origin"] = Origin.FOFA.name
+        config["push_to"] = list(set(config.get("push_to", [])))
+
+        return config
+
     if not params or type(params) != dict:
         return []
 
@@ -117,30 +150,16 @@ def recall(params: dict) -> list:
 
     tasks = list()
     for link in links:
-        config = deepcopy(params.get("config", {}))
-        config["sub"] = link
-        config["saved"] = True
-        config["name"] = naming_task(link)
-        config["push_to"] = list(set(config.get("push_to", [])))
-
-        tasks.append(config)
+        tasks.append(inwrap(sub=link, nocache=True, pardon=False))
 
     if check:
         logger.info(f"[FOFA] start to extract subscription from links, count: {len(links)}")
 
-        results = utils.multi_process_run(func=extract_one, tasks=links)
+        results = utils.multi_thread_run(func=extract_one, tasks=links)
         subscriptions = [x for x in set(itertools.chain.from_iterable(results)) if x]
 
-        for item in subscriptions:
-            config = deepcopy(params.get("config", {}))
-            config["sub"] = item
-            config["checked"] = False
-            config["saved"] = False
-            config["origin"] = Origin.FOFA.name
-            config["name"] = naming_task(item)
-            config["push_to"] = list(set(config.get("push_to", [])))
-
-            tasks.append(config)
+        for link in subscriptions:
+            tasks.append(inwrap(sub=link, nocache=False, pardon=True))
 
         logger.info(f"[FoFA] found {len(subscriptions)} subscriptions: {subscriptions}")
 
